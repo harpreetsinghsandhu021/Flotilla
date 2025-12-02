@@ -188,8 +188,6 @@ impl FlotillaBuilder {
 
         // 5. Once an instance is ready, run setup closure
 
-        // let private_key_path = Path::new("/Users/harpreetsingh/Downloads/flotilla-key-pair.pem");
-        // let public_key_path = Path::new("/Users/harpreetsingh/Downloads/flotilla-key-pair.pub");
         for (name, machines) in &mut machines {
             println!("from loop name: {}", name);
             let f = &setup_fns[name];

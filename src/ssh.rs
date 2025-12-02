@@ -13,8 +13,8 @@ pub struct Session {
 
 impl Session {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        let private_key_path = Path::new("/Users/harpreetsingh/Downloads/flotilla-key-pair.pem");
-        let public_key_path = Path::new("/Users/harpreetsingh/Downloads/flotilla-key-pair.pub");
+        let private_key_path = Path::new("flotilla-key-pair.pem");
+        let public_key_path = Path::new("flotilla-key-pair.pub");
         let start = Instant::now();
         let timeout = Duration::from_secs(120);
 
