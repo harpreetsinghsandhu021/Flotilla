@@ -1,0 +1,12 @@
+[package]
+name = "flotilla"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusoto_core = "0.48.0"
+rusoto_ec2 = "0.48.0"
+rusoto_credential = "0.48.0"
+ssh2 = "0.9"
+tokio = { version = "1", features = ["full"] }
+openssh = "0.11.5"
