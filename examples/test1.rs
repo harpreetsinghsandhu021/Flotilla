@@ -9,7 +9,7 @@ async fn main() {
         "server",
         1,
         MachineSetup::new("t3.micro", "ami-0912f71e06545ad88", |ssh| {
-            ssh.cmd("cat /etc/hostname").map(|out| {
+            ssh.cmd("date").map(|out| {
                 println!("{}", out);
             })
         }),
@@ -30,5 +30,6 @@ async fn main() {
         println!("{}", vms["client"][0].private_ip);
         Ok(())
     })
-    .await;
+    .await
+    .unwrap();
 }

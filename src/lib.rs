@@ -1,11 +1,12 @@
-// use openssh::{KnownHosts, SessionBuilder};
+use anyhow::{Context, Result};
 use rusoto_core::Region;
 use rusoto_ec2::{
-    DescribeInstancesRequest, DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client,
-    RequestSpotInstancesRequest, RequestSpotLaunchSpecification, TerminateInstancesRequest,
+    CancelSpotInstanceRequestsRequest, DescribeInstancesRequest,
+    DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, RequestSpotInstancesRequest,
+    RequestSpotLaunchSpecification, TerminateInstancesRequest,
 };
 
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, thread, time::Duration};
 
 pub mod ssh;
 
@@ -20,13 +21,13 @@ pub struct Machine {
 pub struct MachineSetup {
     instance_type: String,
     ami: String,
-    setup: Box<dyn Fn(&mut ssh::Session) -> io::Result<()>>,
+    setup: Box<dyn Fn(&mut ssh::Session) -> Result<()>>,
 }
 
 impl MachineSetup {
     pub fn new<F>(instance_type: &str, ami: &str, setup: F) -> Self
     where
-        F: Fn(&mut ssh::Session) -> io::Result<()> + 'static,
+        F: Fn(&mut ssh::Session) -> Result<()> + 'static,
     {
         MachineSetup {
             instance_type: instance_type.to_string(),
@@ -60,9 +61,9 @@ impl FlotillaBuilder {
         self.max_duration = hours as i64 * 60;
     }
 
-    pub async fn run<F>(self, f: F)
+    pub async fn run<F>(self, f: F) -> Result<()>
     where
-        F: FnOnce(HashMap<String, Vec<Machine>>) -> io::Result<()>,
+        F: FnOnce(HashMap<String, Vec<Machine>>) -> Result<()>,
     {
         let ec2 = Ec2Client::new(Region::ApSouth1);
 
@@ -85,8 +86,15 @@ impl FlotillaBuilder {
             // req.block_duration_minutes = Some(self.max_duration);
             req.launch_specification = Some(launch);
 
-            let res = ec2.request_spot_instances(req).await.unwrap();
-            let res = res.spot_instance_requests.unwrap();
+            let res = ec2
+                .request_spot_instances(req)
+                .await
+                .context(format!("Failed to request spot instances for {}", name))?;
+
+            let res = res
+                .spot_instance_requests
+                .context("spot_instance_requests should always return spot instance requests.")?;
+
             spot_request_ids.extend(
                 res.into_iter()
                     .filter_map(|sir| sir.spot_instance_request_id)
@@ -101,11 +109,12 @@ impl FlotillaBuilder {
         let mut req = DescribeSpotInstanceRequestsRequest::default();
         req.spot_instance_request_ids = Some(spot_request_ids.clone());
         let instances: Vec<_>;
+        let mut all_active;
         loop {
             let res = ec2
                 .describe_spot_instance_requests(req.clone())
                 .await
-                .unwrap();
+                .context("Failed to describe spot instances")?;
 
             let any_open = res.spot_instance_requests.as_ref().map_or(false, |v| {
                 v.iter()
@@ -113,28 +122,41 @@ impl FlotillaBuilder {
             });
 
             if !any_open {
+                all_active = true;
                 instances = res
                     .spot_instance_requests
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|sir| {
-                        let name = id_to_name
-                            .remove(&sir.spot_instance_request_id.unwrap())
-                            .unwrap_or_default();
-                        id_to_name.insert(sir.instance_id.clone().unwrap_or_default(), name);
-                        sir.instance_id
+                        if sir.state? == "active" {
+                            let name = id_to_name
+                                .remove(
+                                    &sir.spot_instance_request_id
+                                        .expect("spot instance must have spot instance request id"),
+                                )
+                                .expect("every spot request id is made of some machine set");
+                            id_to_name.insert(sir.instance_id.clone()?, name);
+                            sir.instance_id
+                        } else {
+                            all_active = false;
+                            None
+                        }
                     })
                     .collect();
 
                 break;
+            } else {
+                thread::sleep(Duration::from_millis(500));
             }
         }
 
         // 3. Stop spot requests
-        // let mut cancel = CancelSpotInstanceRequestsRequest::default();
-        // cancel.spot_instance_request_ids = spot_request_ids;
+        let mut cancel = CancelSpotInstanceRequestsRequest::default();
+        cancel.spot_instance_request_ids = spot_request_ids;
 
-        // ec2.cancel_spot_instance_requests(cancel).await.unwrap();
+        ec2.cancel_spot_instance_requests(cancel)
+            .await
+            .context("failed to cancel spot instances")?;
 
         // 4. Wait until all instances are up and setups have been run
         let mut machines: HashMap<String, Vec<Machine>> = HashMap::new();
@@ -149,12 +171,12 @@ impl FlotillaBuilder {
             let reservations = ec2
                 .describe_instances(desc_req.clone())
                 .await
-                .unwrap()
+                .context("Failed to describe spot instances")?
                 .reservations
-                .unwrap();
+                .unwrap_or_else(Vec::new);
 
             for reservation in reservations {
-                for instance in reservation.instances.unwrap() {
+                for instance in reservation.instances.unwrap_or_else(Vec::new) {
                     let state = instance
                         .state
                         .as_ref()
@@ -186,27 +208,39 @@ impl FlotillaBuilder {
             }
         }
 
-        // 5. Once an instance is ready, run setup closure
+        // TODO: Assert here that instances in each set is the same as requested.
 
-        for (name, machines) in &mut machines {
-            println!("from loop name: {}", name);
-            let f = &setup_fns[name];
-            for machine in machines {
-                let address = format!("{}:22", machine.public_ip);
-                println!("Waiting for SSH on {}...", address);
-                let mut sess = ssh::Session::connect(&format!("{}:22", machine.public_ip)).unwrap();
-                f(&mut sess).unwrap();
-                machine.ssh = Some(sess);
+        // 5. Once an instance is ready, run setup closure
+        if all_active {
+            for (name, machines) in &mut machines {
+                let f = &setup_fns[name];
+                for machine in machines {
+                    let address = format!("{}:22", machine.public_ip);
+                    println!("Waiting for SSH on {}...", address);
+                    let mut sess =
+                        ssh::Session::connect(&format!("{}:22", machine.public_ip)).context(
+                            format!("Faield to ssh to {} machine {}", name, machine.public_ip),
+                        )?;
+                    f(&mut sess).context(format!("setup procedure for {} machine failed", name))?;
+                    machine.ssh = Some(sess);
+                }
             }
+            // 5. Invoke F closures with machine descriptors
+            f(machines).context("flotilla main routine failed")?;
         }
 
-        // 5. Invoke F closures with machine descriptors
-        f(machines).unwrap();
-
         // 6. Terminate all instances
+
         println!("Terminating Instances");
         let mut termination_req = TerminateInstancesRequest::default();
-        termination_req.instance_ids = desc_req.instance_ids.clone().unwrap();
-        ec2.terminate_instances(termination_req).await.unwrap();
+        termination_req.instance_ids = desc_req
+            .instance_ids
+            .clone()
+            .expect("Go to Describe Instance Request");
+        ec2.terminate_instances(termination_req)
+            .await
+            .context("Failed to terminate flotilla instances")?;
+
+        Ok(())
     }
 }

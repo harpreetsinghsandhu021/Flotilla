@@ -1,5 +1,6 @@
+use anyhow::{Context, Result};
 use ssh2;
-use std::io::{ErrorKind, Result};
+use std::io::ErrorKind;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -45,16 +46,18 @@ impl Session {
             }
         };
 
-        let mut sess = ssh2::Session::new()?;
+        let mut sess = ssh2::Session::new().context("Creating ssh session failed")?;
         sess.set_tcp_stream(tcp);
-        sess.handshake()?;
+        sess.handshake()
+            .context("Failed to perform ssh handshake")?;
 
         sess.userauth_pubkey_file(
             "ec2-user",
             Some(public_key_path), // Optional public key path
             private_key_path,
             Some("flotilla"), // Passphrase (use Some("passphrase") if encrypted)
-        )?;
+        )
+        .context("Failed to authenticate ssh session")?;
 
         Ok(Session {
             ssh: sess,
@@ -65,11 +68,21 @@ impl Session {
     pub fn cmd(&mut self, cmd: &str) -> Result<String> {
         use std::io::Read;
 
-        let mut channel = self.ssh.channel_session()?;
-        channel.exec(cmd)?;
+        let mut channel = self.ssh.channel_session().context(format!(
+            "Failed to create session based channel for cmd '{}'",
+            cmd
+        ))?;
+
+        channel
+            .exec(cmd)
+            .context(format!("Failed to execute the given command '{}'", cmd))?;
         let mut s = String::new();
-        channel.read_to_string(&mut s)?;
-        channel.wait_close()?;
+
+        channel
+            .read_to_string(&mut s)
+            .context("Error while reading channel content")?;
+
+        channel.wait_close().context("Error closing channel")?;
         // println!("{}", channel.exit_status()?);
         Ok(s)
     }
