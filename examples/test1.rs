@@ -9,7 +9,7 @@ async fn main() {
         "server",
         1,
         MachineSetup::new("t3.micro", "ami-0912f71e06545ad88", |ssh| {
-            ssh.cmd("date").map(|out| {
+            ssh.cmd("echo 'hello from server'").map(|out| {
                 println!("{}", out);
             })
         }),
@@ -17,7 +17,7 @@ async fn main() {
 
     b.add_set(
         "client",
-        1,
+        2,
         MachineSetup::new("t3.micro", "ami-0912f71e06545ad88", |ssh| {
             ssh.cmd("date").map(|out| {
                 println!("{}", out);
@@ -28,6 +28,7 @@ async fn main() {
     b.run(|vms: HashMap<String, Vec<Machine>>| {
         println!("{}", vms["server"][0].private_ip);
         println!("{}", vms["client"][0].private_ip);
+        println!("{}", vms["client"][1].private_ip);
         Ok(())
     })
     .await

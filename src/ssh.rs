@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use ssh2;
 use std::io::ErrorKind;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -13,9 +13,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        let private_key_path = Path::new("flotilla-key-pair.pem");
-        let public_key_path = Path::new("flotilla-key-pair.pub");
+    pub fn connect<A: ToSocketAddrs>(addr: A, key: &Path) -> Result<Self, Error> {
+        // let private_key_path = Path::new("flotilla-key-pair.pem");
+        // let public_key_path = Path::new("flotilla-key-pair.pub");
         let start = Instant::now();
         let timeout = Duration::from_secs(120);
 
@@ -52,10 +52,8 @@ impl Session {
             .context("Failed to perform ssh handshake")?;
 
         sess.userauth_pubkey_file(
-            "ec2-user",
-            Some(public_key_path), // Optional public key path
-            private_key_path,
-            Some("flotilla"), // Passphrase (use Some("passphrase") if encrypted)
+            "ec2-user", None, // Optional public key path
+            key, None, // Passphrase (use Some("passphrase") if encrypted)
         )
         .context("Failed to authenticate ssh session")?;
 

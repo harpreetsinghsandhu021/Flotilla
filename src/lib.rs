@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
+use rand::distr::Alphanumeric;
+use rand::prelude::*;
 use rusoto_core::Region;
 use rusoto_ec2::{
-    CancelSpotInstanceRequestsRequest, DescribeInstancesRequest,
-    DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, RequestSpotInstancesRequest,
-    RequestSpotLaunchSpecification, TerminateInstancesRequest,
+    AuthorizeSecurityGroupIngressRequest, CancelSpotInstanceRequestsRequest, CreateKeyPairRequest,
+    CreateSecurityGroupRequest, DeleteKeyPairRequest, DeleteSecurityGroupRequest,
+    DescribeInstancesRequest, DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, IpPermission,
+    IpRange, RequestSpotInstancesRequest, RequestSpotLaunchSpecification,
+    TerminateInstancesRequest,
 };
+use tempfile;
 
-use std::{collections::HashMap, thread, time::Duration};
+use std::{collections::HashMap, io::Write, thread, time::Duration};
 
 pub mod ssh;
 
@@ -67,6 +72,75 @@ impl FlotillaBuilder {
     {
         let ec2 = Ec2Client::new(Region::ApSouth1);
 
+        // Setup Firewall for machines
+        let rng = rand::rng();
+        let mut group_name = String::from("flotilla_security_");
+        group_name.extend(
+            rng.clone()
+                .sample_iter(Alphanumeric)
+                .take(10)
+                .map(char::from),
+        );
+        let mut req = CreateSecurityGroupRequest::default();
+        req.group_name = group_name;
+        req.description = "Security group for Flotilla Spot Instances".to_string();
+        let res = ec2
+            .create_security_group(req)
+            .await
+            .context("Failed to create security group for machines")?;
+
+        let group_id = res
+            .group_id
+            .expect("No Group ID found with the newly created security group");
+
+        let mut update_sec_group_req = AuthorizeSecurityGroupIngressRequest::default();
+        update_sec_group_req.group_id = Some(group_id.clone());
+
+        let mut access = IpPermission::default();
+        access.ip_protocol = Some("tcp".to_string());
+        access.from_port = Some(22);
+        access.to_port = Some(22);
+        access.ip_ranges = Some(vec![IpRange {
+            cidr_ip: Some("0.0.0.0/0".to_string()),
+            ..Default::default()
+        }]);
+
+        let mut crosstalk = IpPermission::default();
+        crosstalk.ip_protocol = Some("tcp".to_string());
+        crosstalk.from_port = Some(0);
+        crosstalk.to_port = Some(65535);
+        crosstalk.ip_ranges = Some(vec![IpRange {
+            cidr_ip: Some("172.31.0.0/16".to_string()),
+            ..Default::default()
+        }]);
+
+        update_sec_group_req.ip_permissions = Some(vec![access, crosstalk]);
+
+        ec2.authorize_security_group_ingress(update_sec_group_req)
+            .await
+            .context("Updating Security Group Failed")?;
+
+        // Consturct Key-Pair for Ssh Acccess
+        let mut create_key_pair_req = CreateKeyPairRequest::default();
+        let mut key_name = "flotilla_key_".to_string();
+        key_name.extend(rng.sample_iter(Alphanumeric).take(10).map(char::from));
+        create_key_pair_req.key_name = key_name.clone();
+        let key_pair_res = ec2
+            .create_key_pair(create_key_pair_req)
+            .await
+            .context("Failed to generate new key pair")?;
+
+        let private_key = key_pair_res
+            .key_material
+            .expect("No Key material found for this key");
+
+        let mut private_key_file = tempfile::NamedTempFile::new()
+            .context("Failed to create temporary file for keypair")?;
+
+        private_key_file
+            .write_all(private_key.as_bytes())
+            .context("could not write private key to file")?;
+
         let mut setup_fns = HashMap::new();
         // 1. Issue Spot Requests
         let mut spot_request_ids = vec![];
@@ -78,8 +152,8 @@ impl FlotillaBuilder {
 
             setup_fns.insert(name.clone(), setup.setup);
 
-            launch.security_groups = Some(vec!["flotilla-sg".to_string()]);
-            launch.key_name = Some("flotilla-key-pair".to_string());
+            launch.security_group_ids = Some(vec![group_id.clone()]);
+            launch.key_name = Some(key_name.to_string());
 
             let mut req = RequestSpotInstancesRequest::default();
             req.instance_count = Some(i64::from(number));
@@ -217,10 +291,14 @@ impl FlotillaBuilder {
                 for machine in machines {
                     let address = format!("{}:22", machine.public_ip);
                     println!("Waiting for SSH on {}...", address);
-                    let mut sess =
-                        ssh::Session::connect(&format!("{}:22", machine.public_ip)).context(
-                            format!("Faield to ssh to {} machine {}", name, machine.public_ip),
-                        )?;
+                    let mut sess = ssh::Session::connect(
+                        &format!("{}:22", machine.public_ip),
+                        private_key_file.path(),
+                    )
+                    .context(format!(
+                        "Faield to ssh to {} machine {}",
+                        name, machine.public_ip
+                    ))?;
                     f(&mut sess).context(format!("setup procedure for {} machine failed", name))?;
                     machine.ssh = Some(sess);
                 }
@@ -240,6 +318,27 @@ impl FlotillaBuilder {
         ec2.terminate_instances(termination_req)
             .await
             .context("Failed to terminate flotilla instances")?;
+
+        let mut termination_req = TerminateInstancesRequest::default();
+        termination_req.instance_ids = desc_req
+            .instance_ids
+            .clone()
+            .expect("Go to Describe Instance Request");
+        ec2.terminate_instances(termination_req)
+            .await
+            .context("Failed to terminate flotilla instances")?;
+
+        // let mut delete_sg_req = DeleteSecurityGroupRequest::default();
+        // delete_sg_req.group_id = Some(group_id);
+        // ec2.delete_security_group(delete_sg_req)
+        //     .await
+        //     .context("Failed to delete security group")?;
+
+        let mut delete_key_req = DeleteKeyPairRequest::default();
+        delete_key_req.key_name = Some(key_name);
+        ec2.delete_key_pair(delete_key_req)
+            .await
+            .context("Failed to delete key pair")?;
 
         Ok(())
     }
