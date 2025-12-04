@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rand::distr::Alphanumeric;
 use rand::prelude::*;
+use rayon::prelude::*;
 use rusoto_core::Region;
 use rusoto_ec2::{
     AuthorizeSecurityGroupIngressRequest, CancelSpotInstanceRequestsRequest, CreateKeyPairRequest,
@@ -26,13 +27,13 @@ pub struct Machine {
 pub struct MachineSetup {
     instance_type: String,
     ami: String,
-    setup: Box<dyn Fn(&mut ssh::Session) -> Result<()>>,
+    setup: Box<dyn Fn(&mut ssh::Session) -> Result<()> + Sync>,
 }
 
 impl MachineSetup {
     pub fn new<F>(instance_type: &str, ami: &str, setup: F) -> Self
     where
-        F: Fn(&mut ssh::Session) -> Result<()> + 'static,
+        F: Fn(&mut ssh::Session) -> Result<()> + 'static + Sync,
     {
         MachineSetup {
             instance_type: instance_type.to_string(),
@@ -238,6 +239,8 @@ impl FlotillaBuilder {
         desc_req.instance_ids = Some(instances);
         let mut all_machine_are_ready = false;
 
+        println!("Console 1");
+
         while !all_machine_are_ready {
             all_machine_are_ready = true;
             machines.clear();
@@ -284,11 +287,12 @@ impl FlotillaBuilder {
 
         // TODO: Assert here that instances in each set is the same as requested.
 
+        println!("Console 2");
         // 5. Once an instance is ready, run setup closure
         if all_active {
             for (name, machines) in &mut machines {
                 let f = &setup_fns[name];
-                for machine in machines {
+                machines.par_iter_mut().for_each(|machine: &mut Machine| {
                     let address = format!("{}:22", machine.public_ip);
                     println!("Waiting for SSH on {}...", address);
                     let mut sess = ssh::Session::connect(
@@ -298,10 +302,13 @@ impl FlotillaBuilder {
                     .context(format!(
                         "Faield to ssh to {} machine {}",
                         name, machine.public_ip
-                    ))?;
-                    f(&mut sess).context(format!("setup procedure for {} machine failed", name))?;
+                    ))
+                    .unwrap();
+                    f(&mut sess)
+                        .context(format!("setup procedure for {} machine failed", name))
+                        .unwrap();
                     machine.ssh = Some(sess);
-                }
+                })
             }
             // 5. Invoke F closures with machine descriptors
             f(machines).context("flotilla main routine failed")?;
