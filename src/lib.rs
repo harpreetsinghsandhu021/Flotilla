@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
+use log::{debug, info, trace};
 use rand::distr::Alphanumeric;
 use rand::prelude::*;
 use rayon::prelude::*;
 use rusoto_core::Region;
 use rusoto_ec2::{
     AuthorizeSecurityGroupIngressRequest, CancelSpotInstanceRequestsRequest, CreateKeyPairRequest,
-    CreateSecurityGroupRequest, DeleteKeyPairRequest, DeleteSecurityGroupRequest,
-    DescribeInstancesRequest, DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, IpPermission,
-    IpRange, RequestSpotInstancesRequest, RequestSpotLaunchSpecification,
-    TerminateInstancesRequest,
+    CreateSecurityGroupRequest, DeleteKeyPairRequest, DescribeInstancesRequest,
+    DescribeSpotInstanceRequestsRequest, Ec2, Ec2Client, IpPermission, IpRange,
+    RequestSpotInstancesRequest, RequestSpotLaunchSpecification, TerminateInstancesRequest,
 };
 use tempfile;
 
@@ -71,7 +71,17 @@ impl FlotillaBuilder {
     where
         F: FnOnce(HashMap<String, Vec<Machine>>) -> Result<()>,
     {
+        simple_logger::SimpleLogger::new()
+            .with_level(log::LevelFilter::Off)
+            .with_module_level("flotilla", log::LevelFilter::Trace)
+            .env()
+            .init()
+            .unwrap();
+        debug!("Booting up Ec2 Client");
+
         let ec2 = Ec2Client::new(Region::ApSouth1);
+
+        info!("Spinning Flotilla");
 
         // Setup Firewall for machines
         let rng = rand::rng();
@@ -82,6 +92,7 @@ impl FlotillaBuilder {
                 .take(10)
                 .map(char::from),
         );
+        trace!("Generated security group name: {}", group_name);
         let mut req = CreateSecurityGroupRequest::default();
         req.group_name = group_name;
         req.description = "Security group for Flotilla Spot Instances".to_string();
@@ -93,6 +104,7 @@ impl FlotillaBuilder {
         let group_id = res
             .group_id
             .expect("No Group ID found with the newly created security group");
+        trace!("Generated security group: {}", group_id);
 
         let mut update_sec_group_req = AuthorizeSecurityGroupIngressRequest::default();
         update_sec_group_req.group_id = Some(group_id.clone());
@@ -105,6 +117,7 @@ impl FlotillaBuilder {
             cidr_ip: Some("0.0.0.0/0".to_string()),
             ..Default::default()
         }]);
+        trace!("Adding ssh access to security group");
 
         let mut crosstalk = IpPermission::default();
         crosstalk.ip_protocol = Some("tcp".to_string());
@@ -114,6 +127,7 @@ impl FlotillaBuilder {
             cidr_ip: Some("172.31.0.0/16".to_string()),
             ..Default::default()
         }]);
+        trace!("Adding internal VM access to security group");
 
         update_sec_group_req.ip_permissions = Some(vec![access, crosstalk]);
 
@@ -122,6 +136,7 @@ impl FlotillaBuilder {
             .context("Updating Security Group Failed")?;
 
         // Consturct Key-Pair for Ssh Acccess
+        trace!("Creating Key Pair");
         let mut create_key_pair_req = CreateKeyPairRequest::default();
         let mut key_name = "flotilla_key_".to_string();
         key_name.extend(rng.sample_iter(Alphanumeric).take(10).map(char::from));
@@ -130,6 +145,7 @@ impl FlotillaBuilder {
             .create_key_pair(create_key_pair_req)
             .await
             .context("Failed to generate new key pair")?;
+        trace!("Created Key Pair successfully");
 
         let private_key = key_pair_res
             .key_material
@@ -141,11 +157,13 @@ impl FlotillaBuilder {
         private_key_file
             .write_all(private_key.as_bytes())
             .context("could not write private key to file")?;
+        trace!("Wrote key-pair to file: {:?}", private_key_file.path());
 
         let mut setup_fns = HashMap::new();
         // 1. Issue Spot Requests
         let mut spot_request_ids = vec![];
         let mut id_to_name = HashMap::new();
+        debug!("Issuing Spot Requests");
         for (name, (setup, number)) in self.descriptors {
             let mut launch = RequestSpotLaunchSpecification::default();
             launch.image_id = Some(setup.ami);
@@ -161,6 +179,7 @@ impl FlotillaBuilder {
             // req.block_duration_minutes = Some(self.max_duration);
             req.launch_specification = Some(launch);
 
+            trace!("Issuing spot request for {}", name);
             let res = ec2
                 .request_spot_instances(req)
                 .await
@@ -174,6 +193,7 @@ impl FlotillaBuilder {
                 res.into_iter()
                     .filter_map(|sir| sir.spot_instance_request_id)
                     .map(|sir| {
+                        trace!("activated spot request {}", name);
                         id_to_name.insert(sir.clone(), name.clone());
                         sir
                     }),
@@ -185,7 +205,9 @@ impl FlotillaBuilder {
         req.spot_instance_request_ids = Some(spot_request_ids.clone());
         let instances: Vec<_>;
         let mut all_active;
+        debug!("Waiting for instances to spawn");
         loop {
+            trace!("checking spot request status");
             let res = ec2
                 .describe_spot_instance_requests(req.clone())
                 .await
@@ -210,8 +232,12 @@ impl FlotillaBuilder {
                                         .expect("spot instance must have spot instance request id"),
                                 )
                                 .expect("every spot request id is made of some machine set");
-                            id_to_name.insert(sir.instance_id.clone()?, name);
-                            sir.instance_id
+
+                            let instance_id = sir.instance_id?;
+
+                            trace!("spot request satisfied {} {}", name, &instance_id);
+                            id_to_name.insert(instance_id.clone(), name);
+                            Some(instance_id)
                         } else {
                             all_active = false;
                             None
@@ -238,8 +264,6 @@ impl FlotillaBuilder {
         let mut desc_req = DescribeInstancesRequest::default();
         desc_req.instance_ids = Some(instances);
         let mut all_machine_are_ready = false;
-
-        println!("Console 1");
 
         while !all_machine_are_ready {
             all_machine_are_ready = true;
@@ -279,7 +303,9 @@ impl FlotillaBuilder {
                         public_ip: instance.public_ip_address.unwrap(),
                         dns: instance.public_dns_name.unwrap_or_default(),
                     };
+
                     let name = id_to_name[&instance.instance_id.unwrap()].clone();
+                    // debug!("Instance ready, set {} ip {}", name, machine.public_ip);
                     machines.entry(name).or_insert_with(Vec::new).push(machine);
                 }
             }
@@ -287,14 +313,15 @@ impl FlotillaBuilder {
 
         // TODO: Assert here that instances in each set is the same as requested.
 
-        println!("Console 2");
         // 5. Once an instance is ready, run setup closure
         if all_active {
+            info!("All Machines are instantiated, running setup");
+
             for (name, machines) in &mut machines {
                 let f = &setup_fns[name];
                 machines.par_iter_mut().for_each(|machine: &mut Machine| {
                     let address = format!("{}:22", machine.public_ip);
-                    println!("Waiting for SSH on {}...", address);
+                    info!("Waiting for SSH on {}...", address);
                     let mut sess = ssh::Session::connect(
                         &format!("{}:22", machine.public_ip),
                         private_key_file.path(),
@@ -304,19 +331,26 @@ impl FlotillaBuilder {
                         name, machine.public_ip
                     ))
                     .unwrap();
+
+                    info!("Setting up {} instance ip {}", name, machine.public_ip);
                     f(&mut sess)
                         .context(format!("setup procedure for {} machine failed", name))
                         .unwrap();
+                    trace!(
+                        "Finished Setting up {} instance ip {}",
+                        name, machine.public_ip
+                    );
                     machine.ssh = Some(sess);
                 })
             }
             // 5. Invoke F closures with machine descriptors
+            info!("Running Flotilla Main Routine");
             f(machines).context("flotilla main routine failed")?;
+            info!("Completed Flotilla Main Routine");
         }
 
         // 6. Terminate all instances
-
-        println!("Terminating Instances");
+        debug!("Terminating Instances");
         let mut termination_req = TerminateInstancesRequest::default();
         termination_req.instance_ids = desc_req
             .instance_ids
@@ -326,27 +360,22 @@ impl FlotillaBuilder {
             .await
             .context("Failed to terminate flotilla instances")?;
 
-        let mut termination_req = TerminateInstancesRequest::default();
-        termination_req.instance_ids = desc_req
-            .instance_ids
-            .clone()
-            .expect("Go to Describe Instance Request");
-        ec2.terminate_instances(termination_req)
-            .await
-            .context("Failed to terminate flotilla instances")?;
-
+        debug!("Cleaning up temporary resources");
+        trace!("Cleaning temporary security group");
         // let mut delete_sg_req = DeleteSecurityGroupRequest::default();
         // delete_sg_req.group_id = Some(group_id);
         // ec2.delete_security_group(delete_sg_req)
         //     .await
         //     .context("Failed to delete security group")?;
 
+        trace!("Cleaning temporary key pair");
         let mut delete_key_req = DeleteKeyPairRequest::default();
         delete_key_req.key_name = Some(key_name);
         ec2.delete_key_pair(delete_key_req)
             .await
             .context("Failed to delete key pair")?;
 
+        info!("Khatamm");
         Ok(())
     }
 }

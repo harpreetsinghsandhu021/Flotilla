@@ -1,4 +1,5 @@
 use anyhow::{Context, Error, Result};
+use log::info;
 use ssh2;
 use std::io::ErrorKind;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -23,7 +24,7 @@ impl Session {
             // 1. Try to connect
             match TcpStream::connect(&addr) {
                 Ok(stream) => {
-                    println!("SSH port is open!");
+                    info!("SSH port is open!");
                     break stream;
                 }
                 Err(e) => {
@@ -36,7 +37,7 @@ impl Session {
                     // We also handle "Resource temporarily unavailable" which can happen on bad networks
                     match e.kind() {
                         ErrorKind::ConnectionRefused | ErrorKind::TimedOut => {
-                            print!("."); // distinct visual feedback
+                            info!("Retrying Connection..."); // distinct visual feedback
                             std::io::Write::flush(&mut std::io::stdout()).unwrap();
                             thread::sleep(Duration::from_secs(1));
                         }
